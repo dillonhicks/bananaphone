@@ -1,0 +1,67 @@
+#!/bin/bash
+
+# exec-with-identity: Somewhat securely execute commands requiring an
+#    ssh identity from a docker context.
+#
+# Usage: (within Dockerfile)
+#
+#   RUN export CREDENTIALS_PORT=${CREDENTIALS_PORT}; \
+#       exec-with-identity pip install -r requirements.txt && \
+#       exec-with-identity git clone git@github.com:your/repo.git
+#
+ssh_ident_timeout=300  # Seconds
+# /dev/shm is the mount point for tm1pfs. tmpfs is a ram backed
+# filesystem and files placed there will not persist between
+# restarts (or after docker builds).
+#
+keyfile="/dev/shm/bananaphone.identity"
+
+# export this variable as the first statement of a Dockerfile RUN statement.
+CREDENTIALS_PORT=${CREDENTIALS_PORT}
+if [ -z "${CREDENTIALS_PORT}" ]
+then
+    echo 'FATAL: Excepted environment variable `CREDENTIALS_PORT` was not set'
+    exit 3
+fi
+
+# On first run curl the port on which the bananaphone daemon is listening
+# to vend the contents of the keyfile specified during the invocation
+# of Make. Dump that out to tmpfs so it is not persisted past build
+# time.
+if [ ! -e "${keyfile}" ]
+then
+    set -e
+    # Ideally curl should be replaced with nc because we are just reading
+    # some dat from a tcp socket, but nc is not included in the
+    # base docker images I use.
+    curl http://localhost:${CREDENTIALS_PORT} > ${keyfile}
+    chmod 400 ${keyfile}
+    set +e
+fi
+
+# Setup SSH config to not verify host keys on trusted domains
+mv /etc/ssh/ssh_config /etc/ssh/ssh_config.bak
+sshconfig=`cat<<EOF
+Host *
+    GlobalKnownHostsFile /dev/null
+    StrictHostKeyChecking no
+EOF
+`
+echo -e "${sshconfig}" > /etc/ssh/ssh_config
+
+# The first attempt tried passing the keyfile contents through the build
+# args and fifos. It failed because the export statement for the run
+# command captures the contents of the variable in the docker history
+# :(
+eval `ssh-agent -s`  # Start SSH Agent
+ssh-add -t ${ssh_ident_timeout} ${keyfile} < /dev/null &
+
+# $@ is the bash equivalent to python's sys.argv[1:], meaning all of the arguments
+# after the name of the executable. So first write the command we are going to run
+# to stdout, then execute that command.
+echo "$@"
+$@
+exit_code=$?
+
+mv /etc/ssh/ssh_config.bak /etc/ssh/ssh_config
+exit ${exit_code}
